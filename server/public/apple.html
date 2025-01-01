@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<link rel="icon" type="image/png" href="/favicon.png">
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=1920">
+	<script type="importmap">
+	{
+		"imports": {
+			"@msgpack/msgpack": "/node_modules/@msgpack/msgpack/dist.es5+esm/index.mjs",
+			"raft": "/node_modules/@dsbunny/raft/raft.mjs"
+		}
+	}
+	</script>
+</head>
+<body>
+<script type="module">
+	import { Raft } from "raft";
+	import { RTCMesh } from "/dist/rtcmesh.js";
+
+	// i is origin.
+	const group = "8cc1fe24-ae72-416f-a6d3-b09d33d9c0e1";
+	const rtc = new RTCMesh({
+		label: group,
+		id: "f7ac595c-45be-477c-a2f9-e8e33cb45b9c",
+		peers: [
+			"f7ac595c-45be-477c-a2f9-e8e33cb45b9c",
+			"47582a65-8da0-48fc-a02b-e876546c9492",
+			"869564f3-c62f-4ed5-8c7b-3849146c3f97",
+		],
+		iceServers: [
+			{ urls: "stun:stun.l.google.com:19302" },
+		],
+	});
+	const MAX_BACKOFF_TIMEOUT = 18 * 1000;
+	const MIN_BACKOFF_TIMEOUT = 3 * 1000;
+	const CONNECT_TIMEOUT = 30 * 1000;
+	let ws;
+	let ws_reconnect_timeout_id;
+	let ws_connect_timeout_id;
+	// a random integer between two values, inclusive
+	function backoff_timeout() {
+		return Math.floor(Math.random() * (MAX_BACKOFF_TIMEOUT - MIN_BACKOFF_TIMEOUT + 1)) + MIN_BACKOFF_TIMEOUT;
+	}
+	rtc.addEventListener('offer', event => {
+		console.log("RTC: offer:", event);
+		ws.send(JSON.stringify({
+			"cmd": "offer",
+			"target": event.detail.id,
+			"sdp": event.detail.sdp,
+		}));
+	});
+	rtc.addEventListener('answer', event => {
+		console.log("RTC: answer:", event);
+		ws.send(JSON.stringify({
+			"cmd": "answer",
+			"target": event.detail.id,
+			"sdp": event.detail.sdp,
+		}));
+	});
+	rtc.addEventListener('icecandidate', event => {
+		console.log("RTC: icecandidate:", event);
+		ws.send(JSON.stringify({
+			"cmd": "icecandidate",
+			"target": event.detail.id,
+			"candidate": event.detail.candidate,
+		}));
+	});
+	rtc.addEventListener('disconnected', event => {
+		console.warn('RTC: disconnected:', event);
+		ws.send(JSON.stringify({
+			"cmd": "disconnected",
+			"target": event.detail.id,
+			"candidate": event.detail.candidate,
+		}));
+	});
+	rtc.addEventListener('failed', event => {
+		console.warn('RTC: failed:', event);
+		ws.send(JSON.stringify({
+			"cmd": "failed",
+			"target": event.detail.id,
+		}));
+	});
+	function ws_close() {
+		if(typeof ws_connect_timeout_id !== "undefined") {
+			clearTimeout(ws_connect_timeout_id);
+			ws_connect_timeout_id = undefined;
+		}
+		ws.removeEventListener('message', ws_onmessage);
+		ws.removeEventListener('error', ws_onerror);
+		ws.removeEventListener('close', ws_onclose);
+		if(ws.readyState !== WebSocket.CLOSED) {
+			ws.close(); // can raise onerror
+		}
+		ws = null;
+	}
+	function ws_onclose(event) {
+		console.log('WS: closed:', event);
+		ws_close();
+		schedule_reconnect();
+	}
+	// The error event is fired when a connection with a WebSocket has been closed due to an error.
+	function ws_onerror(event) {
+		console.log('WS: error:', event);
+		ws_close();
+		schedule_reconnect();
+	}
+	function abort_connect() {
+		console.warn("WS: connect timeout, aborting.");
+		ws_close();
+		schedule_reconnect();
+	}
+	function ws_onmessage(event) {
+		console.log("WS:", event);
+		const json = JSON.parse(event.data);
+		switch(json.cmd) {
+		case 'offer':
+			rtc.createAnswer(json.id, json.sdp);
+			break;
+		case 'negotiationneeded':
+			rtc.createOffer(json.id);
+			break;
+		case 'answer':
+			rtc.addAnswer(json.id, json.sdp);
+			break;
+		case 'disconnected':
+		case 'failed':
+			rtc.close(json.id)
+				.catch(e => {
+					console.warn(e);
+				})
+				.finally(() => {
+					ws.send(JSON.stringify({
+						"cmd": "negotiationneeded",
+						"target": json.id,
+					}));
+				});
+			break;
+		case 'icecandidate':
+			rtc.addIceCandidate(json.id, json.candidate);
+			break;
+		default:
+			break;
+		};
+	}
+	function try_connect() {
+		if(typeof ws_reconnect_timeout_id !== "undefined") {
+			clearTimeout(ws_reconnect_timeout_id);
+			ws_reconnect_timeout_id = undefined;
+		}
+		try {
+			ws = new WebSocket(`wss://${location.host}/ws?group=${group}&id=${rtc.id}`);
+		} catch(e) {
+			console.warn(e);
+			ws = undefined;
+			return;
+		}
+		ws_connect_timeout_id = setTimeout(abort_connect, CONNECT_TIMEOUT);
+		ws.addEventListener('open', () => {
+			console.log("WS: connected.");
+			if(typeof ws_connect_timeout_id !== "undefined") {
+				clearTimeout(ws_connect_timeout_id);
+				ws_connect_timeout_id = undefined;
+			}
+			for(const peer of rtc.peers) {
+				if(peer === rtc.id) {
+					continue;
+				}
+				const readyState = rtc.readyState(peer);
+				switch(readyState) {
+				case "open":
+					break;
+				case "connecting":
+				case "closing":
+					console.log(`RTC: ${peer}: readyState: ${readyState}`);
+					rtc.close(peer)
+						.catch(e => {
+							console.warn(e);
+						})
+						.finally(() => {
+							ws.send(JSON.stringify({
+								"cmd": "negotiationneeded",
+								"target": peer,
+							}));
+						});
+					break;
+				default:
+					console.log(`RTC: ${peer}: readyState: ${readyState}`);
+					ws.send(JSON.stringify({
+						"cmd": "negotiationneeded",
+						"target": peer,
+					}));
+					break;
+				}
+			}
+		});
+		ws.addEventListener('message', ws_onmessage);
+		ws.addEventListener('error', ws_onerror);
+		ws.addEventListener('close', ws_onclose);
+	}
+	function schedule_reconnect() {
+		const delay = backoff_timeout();
+		console.warn("WS: reconnection in", delay/1000, "s");
+		ws_reconnect_timeout_id = setTimeout(try_connect, delay);
+	}
+
+	const raft = new Raft({
+		address: rtc.id,
+		electionMinTimeout: 1500,
+		electionMaxTimeout: 3000,
+		heartbeatInterval: 500,
+	});
+	class Peer {
+		#id;
+		#channel;
+		constructor(id) {
+			this.#id = id;
+			this.#channel = undefined;
+		}
+		get id() {
+			return this.#id;
+		}
+		get readyState() {
+			if(typeof this.#channel === "undefined") {
+				return "new";
+			}
+			return this.#channel.readyState;
+		}
+		set channel(channel) {
+			this.#channel = channel;
+		}
+		send(data) {
+			if(this.readyState !== "open") {
+				return;
+			}
+			try {
+				this.#channel.send(data);
+			} catch(e) {
+				console.warn(e);
+			}
+		}
+	}
+	const peers = new Map();
+	for(const id of rtc.peers) {
+		if(id === rtc.id) {
+			continue;
+		}
+		const peer = new Peer(id);
+		raft.join(id, data => peer.send(data));
+		peers.set(id, peer);
+	}
+	rtc.addEventListener('addchannel', event => {
+		console.log('RTC: addchannel:', event);
+		const peer = peers.get(event.detail.id);
+		if(typeof peer === "undefined") {
+			return;
+		}
+		const channel = rtc.user_channel(peer.id);
+		channel.addEventListener('message', event => {
+			raft.onRaftMessage(event.data, data => peer.send(data));
+		});
+		peer.channel = channel;
+	});
+	// §5.5: Follower and candidate crashes
+	// Avoid direct failure by removing node from list, node recovery will rejoin
+	// the list and update with the next hearbeat or election.
+	rtc.addEventListener('removechannel', event => {
+		console.log('RTC: removechannel:', event);
+		const peer = peers.get(event.detail.id);
+		if(typeof peer === "undefined") {
+			return;
+		}
+		peer.channel = undefined;
+	});
+
+	try_connect();
+
+	setInterval(() => {
+		if(raft.leader) {
+			rtc.broadcast(JSON.stringify({
+				date: Date.now(),
+			}));
+		}
+	}, 1000);
+	function update(_idle_deadline) {
+		const timestamp = performance.now();
+		raft.update(timestamp);
+		requestIdleCallback(update, { timeout: 250 });
+	}
+	requestIdleCallback(update, { timeout: 250 });
+	rtc.addEventListener('message', event => {
+		console.log('RTC: message:', event.detail);
+	});
+</script>
+</body>
+</html>
