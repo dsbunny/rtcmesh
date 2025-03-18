@@ -6,8 +6,8 @@
 	"main": "dist/rtcmesh.js",
 	"types": "dist/rtcmesh.d.ts",
 	"author": "Steve-o <fnjordy@gmail.com>",
-	"license": "UNLICENSED",
-	"private": true,
+	"license": "MIT",
+	"private": false,
 	"scripts": {
 		"build": "tsc",
 		"test": "echo \"Error: no test specified\" && exit 1"

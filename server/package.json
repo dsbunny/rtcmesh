@@ -5,8 +5,8 @@
 	"type": "commonjs",
 	"main": "server.cjs",
 	"author": "Steve-o <fnjordy@gmail.com>",
-	"license": "UNLICENSED",
-	"private": true,
+	"license": "MIT",
+	"private": false,
 	"scripts": {
 		"start": "node server.cjs"
 	},
